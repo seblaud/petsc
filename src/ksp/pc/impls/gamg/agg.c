@@ -1224,11 +1224,12 @@ static PetscErrorCode PCGAMGOptProlongator_AGG(PC pc,Mat Amat,Mat *a_P)
       ierr = MatGetBlockSize(Amat,&bs);CHKERRQ(ierr);
       ierr = MatCreate(comm,&D);CHKERRQ(ierr);
       ierr = MatGetSize(Amat,&m,&n);CHKERRQ(ierr);
+      ierr = MatSetType(D, MATSEQAIJ);CHKERRQ(ierr);
       ierr = MatSetSizes(D,m,n,m,n);CHKERRQ(ierr);
-      MatSeqAIJSetPreallocation(D,bs,NULL);
-      MatMPIAIJSetPreallocation(D,bs,NULL,bs,NULL);
-      MatSetBlockSize(D,bs);
-      MatGetOwnershipRange(D,&rstart,&rend);
+      ierr = MatSeqAIJSetPreallocation(D,bs,NULL);CHKERRQ(ierr);
+      ierr = MatMPIAIJSetPreallocation(D,bs,NULL,bs,NULL);CHKERRQ(ierr);
+      ierr = MatSetBlockSize(D,bs);CHKERRQ(ierr);
+      ierr = MatGetOwnershipRange(D,&rstart,&rend);CHKERRQ(ierr);
       for (int i=rstart/bs; i < rend/bs; i++) {
         MatSetValuesBlocked(D,1,&i,1,&i,&vals[(i-rstart/bs)*bs*bs],INSERT_VALUES);
       }
