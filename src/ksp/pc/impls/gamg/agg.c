@@ -12,6 +12,7 @@ typedef struct {
   PetscInt  nsmooths;
   PetscBool sym_graph;
   PetscInt  square_graph;
+  PetscInt  smooth_pbjacobi;
 } PC_GAMG_AGG;
 
 /*@
@@ -141,6 +142,8 @@ static PetscErrorCode PCSetFromOptions_GAMG_AGG(PetscOptionItems *PetscOptionsOb
   ierr = PetscOptionsHead(PetscOptionsObject,"GAMG-AGG options");CHKERRQ(ierr);
   {
     ierr = PetscOptionsInt("-pc_gamg_agg_nsmooths","smoothing steps for smoothed aggregation, usually 1","PCGAMGSetNSmooths",pc_gamg_agg->nsmooths,&pc_gamg_agg->nsmooths,NULL);CHKERRQ(ierr);
+    /* -pc_gamg_agg_smooth_pbjacobi */
+    ierr = PetscOptionsInt("-pc_gamg_agg_smooth_pbjacobi","Point-block Jacobi operator smoothing","PCGAMGPBJacobi",pc_gamg_agg->smooth_pbjacobi,&pc_gamg_agg->smooth_pbjacobi,NULL);CHKERRQ(ierr);
     ierr = PetscOptionsBool("-pc_gamg_sym_graph","Set for asymmetric matrices","PCGAMGSetSymGraph",pc_gamg_agg->sym_graph,&pc_gamg_agg->sym_graph,NULL);CHKERRQ(ierr);
     ierr = PetscOptionsInt("-pc_gamg_square_graph","Number of levels to square graph for faster coarsening and lower coarse grid complexity","PCGAMGSetSquareGraph",pc_gamg_agg->square_graph,&pc_gamg_agg->square_graph,NULL);CHKERRQ(ierr);
   }
@@ -651,7 +654,7 @@ static PetscErrorCode PCSetData_AGG(PC pc, Mat a_A)
  formProl0
 
    Input Parameter:
-   . agg_llists - list of arrays with aggregates -- list from selected vertices of aggregate unselected vertices 
+   . agg_llists - list of arrays with aggregates -- list from selected vertices of aggregate unselected vertices
    . bs - row block size
    . nSAvec - column bs of new P
    . my0crs - global index of start of locals
@@ -1159,6 +1162,7 @@ static PetscErrorCode PCGAMGOptProlongator_AGG(PC pc,Mat Amat,Mat *a_P)
 
   /* compute maximum value of operator to be used in smoother */
   if (0 < pc_gamg_agg->nsmooths) {
+    PCType pcsmooth;
     ierr = MatCreateVecs(Amat, &bb, 0);CHKERRQ(ierr);
     ierr = MatCreateVecs(Amat, &xx, 0);CHKERRQ(ierr);
     ierr = PetscRandomCreate(PETSC_COMM_SELF,&random);CHKERRQ(ierr);
@@ -1178,7 +1182,12 @@ static PetscErrorCode PCGAMGOptProlongator_AGG(PC pc,Mat Amat,Mat *a_P)
     ierr = KSPSetComputeSingularValues(eksp,PETSC_TRUE);CHKERRQ(ierr);
 
     ierr = KSPGetPC(eksp, &epc);CHKERRQ(ierr);
-    ierr = PCSetType(epc, PCJACOBI);CHKERRQ(ierr);  /* smoother in smoothed agg. */
+    if (pc_gamg_agg->smooth_pbjacobi) {
+      pcsmooth = PCPBJACOBI;
+    } else {
+      pcsmooth = PCJACOBI;
+    }
+    ierr = PCSetType(epc, pcsmooth);CHKERRQ(ierr);  /* smoother in smoothed agg. */
 
     /* solve - keep stuff out of logging */
     ierr = PetscLogEventDeactivate(KSP_Solve);CHKERRQ(ierr);
@@ -1188,7 +1197,8 @@ static PetscErrorCode PCGAMGOptProlongator_AGG(PC pc,Mat Amat,Mat *a_P)
     ierr = PetscLogEventActivate(PC_Apply);CHKERRQ(ierr);
 
     ierr = KSPComputeExtremeSingularValues(eksp, &emax, &emin);CHKERRQ(ierr);
-    ierr = PetscInfo3(pc,"Smooth P0: max eigen=%e min=%e PC=%s\n",emax,emin,PCJACOBI);CHKERRQ(ierr);
+    // ierr = PetscInfo3(pc,"Smooth P0: max eigen=%e min=%e PC=%s\n",emax,emin,PCJACOBI);CHKERRQ(ierr);
+    ierr = PetscInfo3(pc,"Smooth P0: max eigen=%e min=%e PC=%s\n",emax,emin,pcsmooth);CHKERRQ(ierr);
     ierr = VecDestroy(&xx);CHKERRQ(ierr);
     ierr = VecDestroy(&bb);CHKERRQ(ierr);
     ierr = KSPDestroy(&eksp);CHKERRQ(ierr);
@@ -1206,10 +1216,35 @@ static PetscErrorCode PCGAMGOptProlongator_AGG(PC pc,Mat Amat,Mat *a_P)
     /* smooth P1 := (I - omega/lam D^{-1}A)P0 */
     ierr  = MatMatMult(Amat, Prol, MAT_INITIAL_MATRIX, PETSC_DEFAULT, &tMat);CHKERRQ(ierr);
     ierr  = MatCreateVecs(Amat, &diag, 0);CHKERRQ(ierr);
+    if (pc_gamg_agg->smooth_pbjacobi) {
+      Mat D,DAP;
+      const PetscScalar *vals;
+      PetscInt m, n, rstart, rend, bs;
+      ierr = MatInvertBlockDiagonal(Amat,&vals);CHKERRQ(ierr);
+      ierr = MatGetBlockSize(Amat,&bs);CHKERRQ(ierr);
+      ierr = MatCreate(comm,&D);CHKERRQ(ierr);
+      ierr = MatGetSize(Amat,&m,&n);CHKERRQ(ierr);
+      ierr = MatSetSizes(D,m,n,m,n);CHKERRQ(ierr);
+      MatSeqAIJSetPreallocation(D,bs,NULL);
+      MatMPIAIJSetPreallocation(D,bs,NULL,bs,NULL);
+      MatSetBlockSize(D,bs);
+      MatGetOwnershipRange(D,&rstart,&rend);
+      for (int i=rstart/bs; i < rend/bs; i++) {
+        MatSetValuesBlocked(D,1,&i,1,&i,&vals[(i-rstart/bs)*bs*bs],INSERT_VALUES);
+      }
+      MatAssemblyBegin(D,MAT_FINAL_ASSEMBLY);
+      MatAssemblyEnd(D,MAT_FINAL_ASSEMBLY);
+      MatMatMult(D,tMat,MAT_INITIAL_MATRIX,1.0,&DAP);
+      MatDestroy(&tMat);
+      tMat = DAP;
+      MatDestroy(&D);
+    }
+    else {
     ierr  = MatGetDiagonal(Amat, diag);CHKERRQ(ierr); /* effectively PCJACOBI */
     ierr  = VecReciprocal(diag);CHKERRQ(ierr);
     ierr  = MatDiagonalScale(tMat, diag, 0);CHKERRQ(ierr);
     ierr  = VecDestroy(&diag);CHKERRQ(ierr);
+    }
     alpha = -1.4/emax;
     ierr  = MatAYPX(tMat, alpha, Prol, SUBSET_NONZERO_PATTERN);CHKERRQ(ierr);
     ierr  = MatDestroy(&Prol);CHKERRQ(ierr);
